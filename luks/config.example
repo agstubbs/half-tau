@@ -1,0 +1,15 @@
+IMG_NAME=Modbian
+TARGET_HOSTNAME=raspberrypi
+FIRST_USER_NAME=pi
+FIRST_USER_PASS=raspberry
+# Possibility of a Preboot environment wifi selection
+#PBE_WPA_COUNTRY=
+#PBE_WPA_ESSID=
+#PBE_WPA_PASSWORD=
+#ENABLE_PBE_WIFI=0
+WPA_COUNTRY=
+WPA_ESSID=
+WPA_PASSWORD=
+ENABLE_SSH=1
+PUBKEY_SSH_FIRST_USER="ssh-rsa ... comment"
+PUBKEY_ONLY_SSH=1
