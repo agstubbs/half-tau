@@ -1,0 +1,115 @@
+
+* overview
+
+This walkthrough covers the basics, though there are a couple of small-ish issues: https://blog.marcnuri.com/prometheus-grafana-setup-minikube/
+- adds `grafana` helm repo, but then uses the deprecated `stable` repo to install grafana
+- doesn't disable (deprecated) `kube-state-metrics` in the prometheus helm chart
+
+* nfs server
+Very lazy nfs server
+#+BEGIN_EXAMPLE
+  /srv/exports/monitoring/prometheus-server 10.102.0.0/24(rw,sync,no_subtree_check)
+  /srv/exports/monitoring/prometheus-alertmanager 10.102.0.0/24(rw,sync,no_subtree_check)
+  /srv/exports/monitoring/grafana 10.102.0.0/24(rw,no_root_squash,sync,no_subtree_check)
+#+END_EXAMPLE
+
+* prometheus
+The definitive prometheus chart as of writing is here:
+
+https://github.com/prometheus-community/helm-charts
+
+Remember to disable (deprecated) `kube-state-metrics` but then how should they be installed?
+
+
+From newrelic
+https://docs.newrelic.com/docs/integrations/kubernetes-integration/installation/install-kubernetes-integration-using-helm
+"follow the instructions in the [[https://github.com/kubernetes/kube-state-metrics#kubernetes-deployment][kube-state-metrics GitHub repo]] to install it."
+
+** Helm
+Install the prometheus-community helm repo
+
+#+BEGIN_SRC bash
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  helm update
+#+END_SRC
+
+** kube-state-metrics
+Install `kube-state-metrics` prometheus endpoint. The deprecated charts install v1.9.7 from a quay.io repo that doesn't contain arm64 binaries. So install direct from the source.
+
+#+BEGIN_SRC bash
+  git clone https://github.com/kubernetes/kube-state-metrics.git
+  pushd kube-state-metrics/
+  kubectl apply -f examples/standard
+  popd
+#+END_SRC
+
+** Prometheus
+Create persistent volumes, install prometheus, expose the service via a loadbalancer
+
+#+BEGIN_SRC bash
+  kubectl create namespace monitoring
+  kubectl apply -n monitoring -f volumes-prometheus.yml
+  helm install -n monitoring prometheus prometheus-community/prometheus --set kubeStateMetrics.enabled=false --set storage.tsdb.retention.time=3652d  --set storage.tsdb.retention.size=200GB
+  kubectl expose service -n monitoring prometheus-server --type=LoadBalancer --target-port=9090 --name=prometheus-server-lb
+#+END_SRC
+
+** Configmaps
+Update the prometheus-server config maps to scrape interesting targets:
+#+BEGIN_SRC bash
+  kubectl -n monitoring edit cm prometheus-server
+#+END_SRC
+
+*** Enviro
+
+I have a Raspberry Pi Zero WH with a [[https://shop.pimoroni.com/products/enviro?variant=31155658457171][Pimoroni Enviro+ Environmental Sensor]] measuring all kinds of goodies from temperature and air pressure to air quality. I also use [[https://github.com/tijmenvandenbrink/enviroplus_exporter][this Prometheus Exporter]] to enable lovely graphs in grafana.
+
+#+BEGIN_SRC yaml
+  - job_name: environment
+      static_configs:
+      - targets: ['enviro.ffap.uk:8000']
+        labels:
+          group: 'environment'
+          location: 'Cambridge'
+#+END_SRC
+
+* grafana
+
+#+BEGIN_SRC bash
+  #https://github.com/grafana/helm-charts
+  helm repo add grafana https://grafana.github.io/helm-charts
+  helm repo update
+  kubectl apply -n monitoring -f volume-grafana.yml
+  helm install -n monitoring grafana grafana/grafana --set persistence.enabled=true
+  kubectl expose service -n monitoring grafana --type=LoadBalancer --target-port=3000 --name=grafana-lb
+#+END_SRC
+
+#+BEGIN_EXAMPLE
+NAME: grafana
+LAST DEPLOYED: Wed Dec  9 10:10:22 2020
+NAMESPACE: monitoring
+STATUS: deployed
+REVISION: 1
+NOTES:
+1. Get your 'admin' user password by running:
+
+   kubectl get secret --namespace monitoring grafana -o jsonpath="{.data.admin-password}" | base64 --decode ; echo
+
+2. The Grafana server can be accessed via port 80 on the following DNS name from within your cluster:
+
+   grafana.monitoring.svc.cluster.local
+
+   Get the Grafana URL to visit by running these commands in the same shell:
+
+     export POD_NAME=$(kubectl get pods --namespace monitoring -l "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=grafana" -o jsonpath="{.items[0].metadata.name}")
+     kubectl --namespace monitoring port-forward $POD_NAME 3000
+
+3. Login with the password from step 1 and the username: admin
+#+END_EXAMPLE
+* uninstall
+#+BEGIN_SRC bash
+  kubectl delete service prometheus-server-lb
+  helm uninstall prometheus
+  kubectl delete pv prometheus-server-pv
+  kubectl delete pv prometheus-alertmanager-pv
+#+END_SRC
+

@@ -1,0 +1,727 @@
+
+* setting up raspberry pi
+
+** Overview
+
+Here we attempt to set up a Raspberry Pi 64 bit image on a LUKS encrypted partition with an `initrd` (initial RAM disk) containing the utilities and logic required to allow connecting to the instance during the bootsequence over ssh in order to unlock the disk and so to facilitate running a headless server.
+
+Raspberry Pi images are generated using [[https://github.com/RPi-Distro/pi-gen][the `RPi-Distro/pi-gen` repository on GitHub]]. It might be preferable to patch that to generate a suitable image from scratch, rather than modifying an existing image. Here, we modify an image downloaded from the Raspberry Pi Foundation's websites.
+
+I modify the image using a Debian Linux VM running on a macOS machine. I write the resulting image to an SD card on the host macOS machine. Owing to the nature of the Debian VM (on an `x86` architecture), it's a little awkward generating an `arm64` architecture `initrd`; you can't just `chroot` and run the binaries in the rooted environment. Other approaches are possible - building the image on a host Raspberry Pi, for instance, or investigating options using Docker or QEMU or whatever other options might be available by using the `pi-gen` repo directly.
+
+Boot process.
+Out of the box, a special script is specified as being the init process. This script resizes the root partition, changes the disk ID and reboots the system. The resulting second boot uses the standard init and a run-once script resizes the filesystem within that partition as part of the standard boot process.
+
+Plan:
+
+- Create a Raspberry Pi OS that boots to console, connects to WiFi with a running SSH Daemon, installing an ssh key and removing the default password
+- Build an initramfs which can be booted into, allowing ssh connectivity (again, via WiFi) with with utilities for disk manipulation (including crypt setup)
+- Create a mechanism for booting into the initramfs, creating a new LUKS partition with LVM volume inside, and expanding them to fill the whole space
+
+** Download Raspberry Pi OS
+
+The various images are available on the [[https://downloads.raspberrypi.org/][Raspberry Pi Foundation downloads site]]. We are interested in the 64 bit version, first announced in [[https://www.raspberrypi.org/forums/viewtopic.php?p=1668160][this forum post]]. Since that post, there has been an update, and although this doesn't appear to have been announced specifically, it is referred to in the forum thread. Essentially we are interested in the most recent directory under [[https://downloads.raspberrypi.org/raspios_arm64/images/][the 64 bit images download repository]]. As of writing, that's dated 24th, August 2020. Download the `.zip` file (and the corresponding `.sig` file, which we will use in the next step).
+
+** Verify the Download
+
+In order to verify the `.zip` using the `.sig` file, both of which we just downloaded, we have to determine what key we are expecting the file to have been signed with. `gpg` will tell you what key it /was/ signed with, but of course you don't necessarily know that the key isn't controlled by some nefarious malefactor - so the one big caveat here is that you can have much fun trying to find a definitive source stating what the correct key is. [[https://www.raspberrypi.org/forums/viewtopic.php?p=1183978][Related forum post.]] I believe this is the right key, but you should reach your own conclusions.
+#+BEGIN_SRC bash
+  gpg --keyserver pool.sks-keyservers.net --recv-key 54C3DD610D9D1B4AF82A37758738CD6B956F460C
+  gpg --verify ~/Downloads/2020-08-20-raspios-buster-arm64.zip{.sig,}
+#+END_SRC
+Unless you update your `gpg` trust database to ultimately trust the key, the result will probably complain about the key not being trusted, but that the signature is good. "Good signature" is what you're looking for here. If the warnings about trust and certification give you some concerns (and to some extent they probably should), I strongly encourage you to learn how to use the `gpg` tool properly - but this is not that tutorial.
+
+Alternatively, download and use the corresponding `.sha1` or `.sha256` files (or both) to verify the integrity of the `.zip`. This is a slightly different test, and I prefer the GnuPG method, but you really have to find your own level of comfort that your download is not compromised in some way.
+
+** Create new disk image
+We mount the partitions of the image and modify them in place. From [[https://unix.stackexchange.com/a/316410][this StackExchange answer]] we find a mechanism for determining how to determine the correct parameters. First decompress the `.zip` file using something like `unzip` and then determine the partition map of the resulting disk image.
+
+On a Linux box:
+#+BEGIN_SRC bash
+  fdisk -lu ~/Downloads/2020-08-20-raspios-buster-arm64.img
+#+END_SRC
+#+RESULTS:
+:RESULTS:
+Device                                         Boot  Start     End Sectors  Size Id Type
+Downloads/2020-08-20-raspios-buster-arm64.img1        8192  532479  524288  256M  c W95 FAT32 (LBA)
+Downloads/2020-08-20-raspios-buster-arm64.img2      532480 7380991 6848512  3.3G 83 Linux
+:END:
+
+On this image, the Start offsets are 8192 and 532480 for the boot and root partitions, respectively. The sector size is 512 bytes, and this gives us the extra information we need to determine how many bytes into the image each partition is located.
+
+*** create new disk!
+#+BEGIN_SRC bash
+  SOURCE_IMG=~/raspi/2020-08-20-raspios-buster-arm64.img
+  #SOURCE_IMG=~/raspi/2020-08-20-raspios-buster-armhf.img
+  WORK_DIR=$(mktemp -d /tmp/pi-image.XXXXXX)
+
+  # parted output described here https://alioth-lists.debian.net/pipermail/parted-devel/2006-December/000573.html
+  #eval $(sudo /sbin/parted -m ${SOURCE_IMG} unit s print | awk -F: '/^1:/ {sub(/s/,"",$2);sub(/s/,"",$4);printf "BOOT_START=%s\nBOOT_SECTORS=%s\n",$2,$4} /^2:/ {sub(/s/,"",$2);sub(/s/,"",$4);printf "ROOT_START=%s\nROOT_SECTORS=%s\n",$2,$4}')
+  eval $(sudo /sbin/parted -m ${SOURCE_IMG} unit s print | awk -F: 'NR==2 {printf "SOURCE_TOTAL_SECTORS=%s\nSOURCE_SECTOR_SIZE_L=%s\nSOURCE_SECTOR_SIZE_P=%s\n",$2,$4,$5;} /^1:/ {sub(/s/,"",$2);sub(/s/,"",$4);printf "SOURCE_BOOT_START=%s\nSOURCE_BOOT_SECTORS=%s\n",$2,$4} /^2:/ {sub(/s/,"",$2);sub(/s/,"",$4);printf "SOURCE_ROOT_START=%s\nSOURCE_ROOT_SECTORS=%s\n",$2,$4}')
+  SOURCE_SECTOR_SIZE=${SOURCE_SECTOR_SIZE_L}
+  #BOOT_START=8192
+  #BOOT_SECTORS=524288
+  #ROOT_START=532480
+  #ROOT_SECTORS=6848512
+
+  WORK_BOOT_IMG=${WORK_DIR}/$(basename -s .img ${SOURCE_IMG}).boot
+  WORK_ROOT_IMG=${WORK_DIR}/$(basename -s .img ${SOURCE_IMG}).root
+
+  #boot partition:
+  dd bs=${SOURCE_SECTOR_SIZE} skip=${SOURCE_BOOT_START} count=${SOURCE_BOOT_SECTORS} if=${SOURCE_IMG} of=${WORK_BOOT_IMG}
+
+  #root partition:
+  dd bs=${SOURCE_SECTOR_SIZE} skip=${SOURCE_ROOT_START} count=${SOURCE_ROOT_SECTORS} if=${SOURCE_IMG} of=${WORK_ROOT_IMG}
+
+  MNT_BOOT=~/mnt/boot
+  mkdir -p ${MNT_BOOT}
+  sudo mount -o loop ${WORK_BOOT_IMG} ${MNT_BOOT}
+
+  MNT_ROOT=~/mnt/root
+  mkdir -p ${MNT_ROOT}
+  sudo mount -o loop ${WORK_ROOT_IMG} ${MNT_ROOT}
+#+END_SRC
+
+*** ROOT partition operations
+**** modify pi user
+
+From Pi-Gen config:
+#+BEGIN_SRC bash
+  FIRST_USER_NAME=pi
+  FIRST_USER_PASS=raspberry
+#+END_SRC
+
+We change the password which is stored in the `/etc/shadow` file. The format is described in [[https://linux-audit.com/password-security-with-linux-etc-shadow-file/][this blog post]] and [[https://www.cyberciti.biz/faq/understanding-etcshadow-file/][this article.]] There is a description of how to change a password in [[https://unix.stackexchange.com/a/76315][this StackExchange answer.]] Alternatively, remove the password completely.
+
+The default password in the image we have downloaded is "raspberry" stored in a salted SHA-512 format. We can verify this as follows:
+#+BEGIN_SRC bash
+  SHADOW=$(sudo cat ${MNT_ROOT}/etc/shadow | grep ${FIRST_USER_NAME}: | cut -f2 -d: )
+  SALT=$(echo $SHADOW | cut -f3 -d\$)
+  HASH=$(echo $SHADOW | cut -f4 -d\$)
+  CALC=$(python3 -c "import crypt;print(crypt.crypt('${FIRST_USER_PASS}', '\$6\$${SALT}\$'))")
+  [ "$SHADOW" == "$CALC" ] && echo "calculated password matches"
+#+END_SRC
+Although `perl` is often better suited for pithy one-liners, the [[https://perldoc.perl.org/functions/crypt][perldoc documentation]] unfortunately is a bit opaque. It makes more sense when you read it in combination with the [[https://www.man7.org/linux/man-pages/man3/crypt.3.html][crypt(3) manpage.]] Instead, we use `python` for consistency, and the [[https://docs.python.org/3/library/crypt.html#crypt.crypt][crypt pydoc]] is somewhat clearer.
+
+The following removes the password. We'll use an ssh key instead for headless operation, so we don't need a password - let alone the /default/ password:
+
+#+BEGIN_SRC bash
+  sudo sed -i -e "s/^${FIRST_USER_NAME}:[^:]*:/${FIRST_USER_NAME}:*:/" ${MNT_ROOT}/etc/shadow
+#+END_SRC
+N.B. that first `*` character is a regex modify; the second occurrance is a literal replacement.
+
+N.B. this is OK as `sudo` doesn't require us to enter a password.
+
+**** change ssh config
+
+Add an ssh key to ~${FIRST_USER_NAME}/.ssh/authorized_keys:
+#+BEGIN_SRC bash
+  PI_UID=$(cat ${MNT_ROOT}/etc/passwd | grep ^${FIRST_USER_NAME}: | cut -f3 -d:)
+  PI_GID=$(cat ${MNT_ROOT}/etc/passwd | grep ^${FIRST_USER_NAME}: | cut -f4 -d:)
+  sudo mkdir -p ${MNT_ROOT}/home/${FIRST_USER_NAME}/.ssh
+  sudo chmod 750 ${MNT_ROOT}/home/${FIRST_USER_NAME}/.ssh
+  if [ -n "${PUBKEY_SSH_FIRST_USER}" ] ; then
+      echo ${PUBKEY_SSH_FIRST_USER} | sudo tee -a ${MNT_ROOT}/home/${FIRST_USER_NAME}/.ssh/authorized_keys
+  else
+      if [ -f ~/.ssh/authorized_keys ] ; then
+          cat ~/.ssh/authorized_keys | sudo tee -a ${MNT_ROOT}/home/${FIRST_USER_NAME}/.ssh/authorized_keys
+      fi
+  fi
+  sudo chmod 640 ${MNT_ROOT}/home/${FIRST_USER_NAME}/.ssh/authorized_keys
+  sudo chown -R ${PI_UID}:${PI_GID} ${MNT_ROOT}/home/${FIRST_USER_NAME}/.ssh
+#+END_SRC
+
+Change the global ssh config to disallow passwords as follows:
+#+BEGIN_SRC bash
+  sudo sed -i -e 's/^#PasswordAuthentication .*$/PasswordAuthentication No/' ${MNT_ROOT}/etc/ssh/sshd_config
+#+END_SRC
+
+Now we could ensure the ssh service starts by default by adding the necessary targets and whatnot, but in fact this is done by the `sshswitch` service which runs on the presence of a file `ssh` or `ssh.txt` on the `/boot` partition.
+
+#+BEGIN_SRC bash
+  sudo touch ${MNT_BOOT}/ssh
+#+END_SRC
+
+**** headless
+From [[https://www.systutorials.com/change-systemd-boot-target-linux/][this tutorial]] we can boot to console instead of booting to desktop first time. We also want to prevent auto-logging in.
+
+Looking at the source for `raspi-config` we determine the following steps are required:
+#+BEGIN_SRC bash
+  sudo rm -f ${MNT_ROOT}/etc/systemd/system/default.target
+  sudo ln -fs /lib/systemd/system/multi-user.target ${MNT_ROOT}/etc/systemd/system/default.target
+  sudo ln -fs /lib/systemd/system/getty@.service ${MNT_ROOT}/etc/systemd/system/getty.target.wants/getty@tty1.service
+  sudo rm -f ${MNT_ROOT}/etc/systemd/system/getty@tty1.service.d/autologin.conf
+#+END_SRC
+
+N.B., to enable ssh and wireless networking, we need to set up some files in the BOOT partition, which follows below.
+
+*** BOOT partition operations
+We mount the boot partition somewhere suitable and modify its contents
+**** Kernel command line
+
+Splash screen is pretty but boot messages are more useful. Remove splash, quiet.
+#+BEGIN_SRC bash
+  sudo sed -i -e 's/ quiet\b//' -e 's/ splash\b//' ${MNT_BOOT}/cmdline.txt
+  # https://github.com/NixOS/nixpkgs/issues/70230
+  sudo sed -i -e 's/^#hdmi_force_hotplug=1/hdmi_force_hotplug=1/' ${MNT_BOOT}/config.txt
+#+END_SRC
+
+
+**** Wireless network
+Using [[https://www.raspberrypi.org/documentation/configuration/wireless/headless.md][a Rasberry Pi Foundation document]] we set up wireless networking for our headless environment.
+
+Prerequisites:
+#+BEGIN_SRC bash
+  WPA_ESSID=
+  WPA_PASSWORD=
+  WPA_COUNTRY=GB
+#+END_SRC
+
+Configuration:
+
+#+BEGIN_SRC bash
+  cat <<EOF | sudo tee ${MNT_BOOT}/wpa_supplicant.conf
+  ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+  update_config=1
+  country=${WPA_COUNTRY}
+
+  network={
+          ssid="${WPA_ESSID}"
+          psk="${WPA_PASSWORD}"
+          key_mgmt=WPA-PSK
+  }
+  EOF
+#+END_SRC
+
+**** Screen Resolution
+
+There are a variety of resources on the internet describing how to modify the resolution. For instance [[https://pimylifeup.com/raspberry-pi-screen-resolution/][here]].
+#+BEGIN_SRC bash
+  sudo sed -i -e 's/^#hdmi_group=.*$/hdmi_group=2/' -e 's/^#hdmi_mode=.*$/hdmi_mode=9/' ${MNT_BOOT}/config.txt
+#+END_SRC
+
+** Write disk image
+
+**** write the image
+#+BEGIN_SRC bash
+  TARGET=~/Downloads/disk.img
+
+  if [ -e ${TARGET} ] ; then
+      eval $(sudo /sbin/parted -m ${TARGET} unit s print | awk -F: 'NR==2 {sub(/s/,"",$2);printf "TARGET_TOTAL_SECTORS=%s\nTARGET_SECTOR_SIZE_L=%s\nTARGET_SECTOR_SIZE_P=%s\n",$2,$4,$5;}')
+      TARGET_SECTOR_SIZE=${TARGET_SECTOR_SIZE_L}
+      TARGET_SIZE_GB=$((${TARGET_SECTOR_SIZE}*${TARGET_TOTAL_SECTORS}/(1024*1024*1024)))
+      if [ ! -b ${TARGET} ] ; then
+          echo "warning: target already exists and is not a block special"
+      fi
+  else
+      # creating a new image
+      TARGET_SIZE_GB=12
+      TARGET_SECTOR_SIZE=512
+      TARGET_TOTAL_SECTORS=$(($TARGET_SIZE_GB*1024*1024*1024/$TARGET_SECTOR_SIZE))
+  fi
+
+  # WORK_ROOT_SECTORS=$(stat --printf="%b" ${WORK_ROOT_IMG})
+  # WORK_ROOT_SECTOR_SIZE=$(stat --printf="%B" ${WORK_ROOT_IMG})
+  # WORK_BOOT_SECTORS=$(stat --printf="%b" ${WORK_BOOT_IMG})
+  # WORK_BOOT_SECTOR_SIZE=$(stat --printf="%B" ${WORK_BOOT_IMG})
+
+  WORK_BOOT_SIZE=$(stat --printf="%s" ${WORK_BOOT_IMG})
+  WORK_ROOT_SIZE=$(stat --printf="%s" ${WORK_ROOT_IMG})
+
+  # FIXME: potential bug here where root or boot size is not an integer multiple of target sector size
+  TARGET_BOOT_SECTORS=$((${WORK_BOOT_SIZE}/${TARGET_SECTOR_SIZE}))
+  TARGET_ROOT_SECTORS=$((${WORK_ROOT_SIZE}/${TARGET_SECTOR_SIZE}))
+  TARGET_ROOT_HEADROOM_GB=2
+  TARGET_ROOT_HEADROOM_SECTORS=$((${TARGET_ROOT_HEADROOM_GB}*1024*1024*1024/${TARGET_SECTOR_SIZE}))
+
+  TARGET_BOOT_START=8192
+  TARGET_ROOT_START=$((${TARGET_TOTAL_SECTORS}-${TARGET_ROOT_SECTORS}-${TARGET_ROOT_HEADROOM_SECTORS}))
+
+  TARGET_SPARE_START=$(( ${TARGET_BOOT_START} + ${TARGET_BOOT_SECTORS} ))
+  TARGET_SPARE_SECTORS=$(( ${TARGET_ROOT_START} - ${TARGET_SPARE_START} ))
+
+  for i in `mount | grep "^${TARGET}" | cut -f1 -d' '` ; do sudo umount "$i" ; done
+
+  TARGET_BOOT_PNO=1
+  TARGET_SPARE_PNO=2
+  TARGET_ROOT_PNO=3
+
+  #sudo parted "${TARGET}" mklabel msdos
+  sudo /sbin/sfdisk "${TARGET}" << EOF
+  ${TARGET_BOOT_START},${TARGET_BOOT_SECTORS},c
+  ${TARGET_SPARE_START},${TARGET_SPARE_SECTORS},e8
+  ${TARGET_ROOT_START},${TARGET_ROOT_SECTORS},83
+  EOF
+  sync
+  eval $(sudo /sbin/blkid -o export "${TARGET}")
+
+  sudo sed -i -e 's+PARTUUID=[^ ]* +PARTUUID='${PTUUID}'-0'${TARGET_ROOT_PNO}' +' "${MNT_BOOT}/cmdline.txt"
+  sudo sed -i -e 's+PARTUUID=[^ -]*-01 +PARTUUID='${PTUUID}'-0'${TARGET_BOOT_PNO}' +' "${MNT_ROOT}/etc/fstab"
+  # if we're reusing an image, -02 will have changed to -03 already, so ignore that difference
+  sudo sed -i -e 's+PARTUUID=[^ -]*-0[23] +PARTUUID='${PTUUID}'-0'${TARGET_ROOT_PNO}' +' "${MNT_ROOT}/etc/fstab"
+
+  sudo umount "${MNT_BOOT}"
+  sudo umount "${MNT_ROOT}"
+
+  if [ -b "${TARGET}" ] ; then
+      sudo dd bs=${TARGET_SECTOR_SIZE} count=${TARGET_BOOT_SECTORS} if="${WORK_BOOT_IMG}" of="${TARGET}${TARGET_BOOT_PNO}"
+      sudo dd bs=${TARGET_SECTOR_SIZE} count=${TARGET_ROOT_SECTORS} if="${WORK_ROOT_IMG}" of="${TARGET}${TARGET_ROOT_PNO}"
+  else
+      dd bs=${TARGET_SECTOR_SIZE} seek=${TARGET_BOOT_START} count=${TARGET_BOOT_SECTORS} if="${WORK_BOOT_IMG}" of="${TARGET}"
+      dd bs=${TARGET_SECTOR_SIZE} seek=${TARGET_ROOT_START} count=${TARGET_ROOT_SECTORS} if="${WORK_ROOT_IMG}" of="${TARGET}"
+  fi
+
+  sync
+  sudo eject "${TARGET}"
+#+END_SRC
+
+** init
+update the software
+#+BEGIN_SRC bash
+  sudo apt-get update && sudo apt-get -y dist-upgrade
+
+  sudo shutdown -r now
+#+END_SRC
+
+** LUKS
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=901830
+/usr/share/initramfs-tools/hooks/fix-cryptsetup
+
+** install initramfs utilities
+#+BEGIN_SRC bash
+  sudo apt-get install -y busybox cryptsetup initramfs-tools dropbear-initramfs lvm2
+#+END_SRC
+
+#http://www.marcfargas.com/posts/enable-wireless-debian-initramfs/
+
+** install wifi
+The Raspberry Pi 4 uses a Broadcom chip and the relevant firmware config and magic blobs need to be incorporated into the `initrd` along with the configuration utilites.
+
+Configuration:
+#+BEGIN_SRC bash
+  if [ -f /etc/wpa_supplicant/wpa_supplicant.conf ] ; then
+      if [ -z "${WPA_ESSID}" ] ; then
+          WPA_ESSID=$(sudo cat /etc/wpa_supplicant/wpa_supplicant.conf | sed -ne 's+^.*ssid=[ "]*\([^ "]*\)[ "]*$+\1+p')
+      fi
+      if [ -z "${WPA_PASSWORD}" ] ; then
+          WPA_PASSWORD=$(sudo cat /etc/wpa_supplicant/wpa_supplicant.conf | sed -ne 's+^.*psk=[ "]*\([^ "]*\)[ "]*$+\1+p')
+      fi
+      if [ -z "${WPA_COUNTRY}" ] ; then
+          WPA_COUNTRY=$(sudo cat /etc/wpa_supplicant/wpa_supplicant.conf | sed -ne 's+^.*country=[ "]*\([^ "]*\)[ "]*$+\1+p')
+      fi
+  fi
+
+  cat <<EOF | sudo tee /etc/initramfs-tools/wpa_supplicant.conf
+  ctrl_interface=/tmp/wpa_supplicant
+  update_config=1
+  country=${WPA_COUNTRY}
+
+  network={
+          ssid="${WPA_ESSID}"
+          psk="${WPA_PASSWORD}"
+          key_mgmt=WPA-PSK
+  }
+  EOF
+
+  cat<<EOF|sudo tee /etc/initramfs-tools/hooks/enable-wireless
+  # !/bin/sh
+  set -e
+  PREREQ=""
+  prereqs()
+  {
+      echo "\${PREREQ}"
+  }
+  case "\${1}" in
+      prereqs)
+          prereqs
+          exit 0
+          ;;
+  esac
+
+  . /usr/share/initramfs-tools/hook-functions
+
+  # CHANGE HERE for your correct modules.
+  manual_add_modules brcmfmac brcmutil brcmutil cfg80211 8021q garp stp llc
+  copy_exec /sbin/wpa_supplicant
+  copy_exec /sbin/wpa_cli
+  copy_exec /sbin/iwconfig
+  copy_exec /etc/initramfs-tools/wpa_supplicant.conf /etc/wpa_supplicant.conf
+  cp -a /lib/firmware/brcm/brcm*.txt \${DESTDIR}/usr/lib/firmware/brcm
+  cp -a /lib/firmware/brcm/brcm*.clm_blob \${DESTDIR}/usr/lib/firmware/brcm
+  EOF
+  sudo chmod +x /etc/initramfs-tools/hooks/enable-wireless
+
+  #https://hamy.io/post/0009/how-to-install-luks-encrypted-ubuntu-18.04.x-server-and-enable-remote-unlocking/#gsc.tab=0
+
+  # dropbear will complain if it isn't given an authorized_keys file
+  if [ -f ~/.ssh/authorized_keys ] ; then
+      sudo cp ~/.ssh/authorized_keys /etc/dropbear-initramfs/authorized_keys
+  else
+      if [ -n "${PUBKEY_SSH_FIRST_USER}" ] ; then
+          echo ${PUBKEY_SSH_FIRST_USER}|sudo tee /etc/dropbear-initramfs/authorized_keys
+      fi
+  fi
+
+  sudo sed -i 's/^#DROPBEAR_OPTIONS=.*$/DROPBEAR_OPTIONS="-p 2222"/' /etc/dropbear-initramfs/config
+  sudo sed -i -e 's/^DEVICE=.*$/DEVICE=wlan0/' /etc/initramfs-tools/initramfs.conf
+
+  #https://robpol86.com/raspberry_pi_luks.html
+  cat<<EOF| sudo tee /etc/kernel/postinst.d/initramfs-rebuild
+  #!/bin/sh -e
+
+  # Rebuild initramfs.gz after kernel upgrade to include new kernel's modules.
+  # https://github.com/Robpol86/robpol86.com/blob/master/docs/_static/initramfs-rebuild.sh
+  # Save as (chmod +x): /etc/kernel/postinst.d/initramfs-rebuild
+
+  # Remove splash from cmdline.
+  if grep -q '\bsplash\b' /boot/cmdline.txt; then
+    sed -i 's/ \?splash \?/ /' /boot/cmdline.txt
+  fi
+
+  # Exit if not building kernel for this Raspberry Pi's hardware version.
+  version="\$1"
+  current_version="\$(uname -r)"
+  case "\${current_version}" in
+    ,*-v8+)
+      case "\${version}" in
+        ,*-v8+) ;;
+        ,*) exit 0
+      esac
+    ;;
+    ,*+)
+      case "\${version}" in
+        ,*-v8+) exit 0 ;;
+      esac
+    ;;
+  esac
+
+  # Exit if rebuild cannot be performed or not needed.
+  [ -x /usr/sbin/mkinitramfs ] || exit 0
+  [ -f /boot/initramfs.gz ] || exit 0
+  lsinitramfs /boot/initramfs.gz |grep -q "/\$version$" && exit 0  # Already in initramfs.
+
+  # Rebuild.
+  mkinitramfs -o /boot/initramfs.gz "\$version"
+  EOF
+  sudo chmod +x /etc/kernel/postinst.d/initramfs-rebuild
+
+  cat<<EOF| sudo tee /etc/initramfs-tools/hooks/resize2fs
+  #!/bin/sh -e
+
+  # Copy resize2fs, fdisk, and other kernel modules into initramfs image.
+  # https://github.com/Robpol86/robpol86.com/blob/master/docs/_static/resize2fs.sh
+  # Save as (chmod +x): /etc/initramfs-tools/hooks/resize2fs
+
+  COMPATIBILITY=true  # Set to false to skip copying other kernel's modules.
+
+  PREREQ=""
+  prereqs () {
+    echo "\${PREREQ}"
+  }
+  case "\${1}" in
+    prereqs)
+      prereqs
+      exit 0
+    ;;
+  esac
+
+  . /usr/share/initramfs-tools/hook-functions
+
+  copy_exec /sbin/resize2fs /sbin
+  copy_exec /sbin/fdisk /sbin
+  copy_exec /sbin/fsck.ext4
+  copy_exec /sbin/mkfs.ext4
+  copy_exec /sbin/parted
+
+  # Raspberry Pi 1 and 2+3 use different kernels. Include the other.
+  if "\${COMPATIBILITY}"; then
+    case "\${version}" in
+      ,*-v8+) other_version="\$(echo \${version} |sed 's/-v8+$/+/')" ;;
+      ,*+) other_version="\$(echo \${version} |sed 's/+$/-v8+/')" ;;
+      ,*)
+        echo "Warning: kernel version doesn't end with +, ignoring."
+        exit 0
+    esac
+    cp -r /lib/modules/\${other_version} \${DESTDIR}/lib/modules/
+  fi
+  EOF
+  sudo chmod +x /etc/initramfs-tools/hooks/resize2fs
+
+  sudo sed -i 's/^#CRYPTSETUP=.*$/CRYPTSETUP=y/' /etc/cryptsetup-initramfs/conf-hook
+
+
+  #https://raspberrypi.stackexchange.com/questions/112109/raspberry-pi-4-doesnt-show-a-wireless-interface-what-drivers-are-required
+
+  #http://www.marcfargas.com/posts/enable-wireless-debian-initramfs/
+  cat<<EOF|sudo tee /etc/initramfs-tools/scripts/init-premount/a_enable_wireless
+  #!/bin/sh
+  PREREQ=""
+  prereqs()
+  {
+      echo "\$PREREQ"
+  }
+
+  case \$1 in
+  prereqs)
+      prereqs
+      exit 0
+      ;;
+  esac
+
+  . /scripts/functions
+
+  AUTH_LIMIT=30
+
+  alias WPACLI="/sbin/wpa_cli -p/tmp/wpa_supplicant -i\$DEVICE "
+
+  log_begin_msg "Starting WLAN connection"
+  /sbin/wpa_supplicant  -i\$DEVICE -c/etc/wpa_supplicant.conf -P/run/initram-wpa_supplicant.pid -B -f /tmp/wpa_supplicant.log
+
+  # Wait for AUTH_LIMIT seconds, then check the status
+  limit=\${AUTH_LIMIT}
+
+  echo -n "Waiting for connection (max \${AUTH_LIMIT} seconds)"
+  while [ \$limit -ge 0 -a `WPACLI status | grep wpa_state` != "wpa_state=COMPLETED" ]
+  do
+      sleep 1
+      echo -n "."
+      limit=`expr \$limit - 1`
+  done
+  echo ""
+
+  if [ `WPACLI status | grep wpa_state` != "wpa_state=COMPLETED" ]; then
+    ONLINE=0
+    log_failure_msg "WLAN offline after timeout"
+    panic
+  else
+    ONLINE=1
+    log_success_msg "WLAN online"
+  fi
+
+  configure_networking
+  EOF
+  sudo chmod a+x /etc/initramfs-tools/scripts/init-premount/a_enable_wireless
+
+  cat<<EOF|sudo tee /etc/initramfs-tools/scripts/local-bottom/kill_wireless
+  #!/bin/sh
+  PREREQ=""
+  prereqs()
+  {
+      echo "\$PREREQ"
+  }
+
+  case \$1 in
+  prereqs)
+      prereqs
+      exit 0
+      ;;
+  esac
+
+  echo "Killing wpa_supplicant so the system takes over later."
+  kill \$(cat /run/initram-wpa_supplicant.pid)
+  EOF
+  sudo chmod a+x /etc/initramfs-tools/scripts/local-bottom/kill_wireless
+#+END_SRC
+
+** setup luks encrypted partition, initramfs
+#+BEGIN_SRC bash
+  eval $(sudo blkid -o export /dev/mmcblk0)
+
+  DEFAULT_KEY="default"
+  CRYPT_CONTAINER=rootfs
+  VG_NAME=vg0_${PTUUID}
+  LV_NAME=lvroot_${PTUUID}
+  LUKS_DEV=/dev/mmcblk0p2
+
+  echo -n "${DEFAULT_KEY}" | sudo /sbin/cryptsetup luksFormat --hash=sha512 --key-size=512 --cipher=aes-xts-plain64 ${LUKS_DEV}
+  echo -n "${DEFAULT_KEY}" | sudo /sbin/cryptsetup luksOpen ${LUKS_DEV} ${CRYPT_CONTAINER}
+  sudo pvcreate /dev/mapper/${CRYPT_CONTAINER}
+  sudo vgcreate ${VG_NAME} /dev/mapper/${CRYPT_CONTAINER}
+  sudo lvcreate -n ${LV_NAME} -l +100%FREE ${VG_NAME}
+  sudo mkfs.ext4 /dev/mapper/${VG_NAME}-${LV_NAME}
+
+  #specifying initramfs as an option here forces crypttab entry in initramfs
+  cat<<EOF|sudo tee -a /etc/crypttab
+  ${CRYPT_CONTAINER} ${LUKS_DEV} none luks,discard,initramfs
+  EOF
+
+  sudo sed -i -e 's+^[^ ]*  */  *\(.*\)$+/dev/mapper/'"${VG_NAME}-${LV_NAME}"' / \1+' /etc/fstab
+  sudo sed -i -e 's+root=[^ ]* +root=/dev/mapper/'"${VG_NAME}-${LV_NAME}"' +' /boot/cmdline.txt
+  sudo sed -i -e 's_^\(.*\)$_\1 cryptdevice='"${LUKS_DEV}:${CRYPT_CONTAINER}"' cryptdm='"${CRYPT_CONTAINER}"'_' /boot/cmdline.txt
+
+  # mk the initramfs
+
+  sudo mkinitramfs -o /boot/initramfs.gz
+  cat<<EOF| sudo tee -a /boot/config.txt
+  initramfs initramfs.gz followkernel
+  EOF
+  #sudo sed -i -e 's/$/ break=mount/' /boot/cmdline.txt 
+  #lsinitramfs -l /boot/initramfs.gz | grep cryptroot/crypttab
+#+END_SRC
+
+** populate new root partition on next boot
+Boot into RAMFS and set up the partitions
+
+#+BEGIN_SRC bash
+  eval $(/sbin/blkid -o export /dev/mmcblk0)
+
+  DEFAULT_KEY="default"
+  CRYPT_CONTAINER=rootfs
+  VG_NAME=vg0_${PTUUID}
+  LV_NAME=lvroot_${PTUUID}
+  DISK_DEV=/dev/mmcblk0
+  LUKS_DEV="${DISK_DEV}p2"
+  RAW_DEV="${DISK_DEV}p3"
+
+  echo -n "${DEFAULT_KEY}" | /sbin/cryptsetup luksOpen ${LUKS_DEV} ${CRYPT_CONTAINER}
+
+  mkdir -p /mnt/raw
+  mount -o ro,noatime ${RAW_DEV} /mnt/raw/
+
+  /sbin/lvm vgchange -a y
+
+  mkdir -p /mnt/cooked
+  mount -o noatime "/dev/mapper/${VG_NAME}-${LV_NAME}" /mnt/cooked
+
+  /mnt/raw/usr/bin/rsync -avuH /mnt/raw/ /mnt/cooked/
+
+  umount /mnt/raw
+  umount /mnt/cooked
+
+  /sbin/lvm vgchange -a n
+  /sbin/cryptsetup luksClose ${CRYPT_CONTAINER}
+
+  ###
+
+  eval $(/sbin/parted -m ${DISK_DEV} unit s print | awk -F: '/^1:/ {sub(/s/,"",$2);sub(/s/,"",$4);printf "BOOT_START=%s\nBOOT_SECTORS=%s\n",$2,$4} /^2:/ {sub(/s/,"",$2);sub(/s/,"",$4);printf "ROOT_START=%s\nROOT_SECTORS=%s\n",$2,$4}')
+  eval $(/sbin/parted -m ${DISK_DEV} unit s print | awk -F: '/^\/dev\// {sub(/s/,"",$2);printf "DISK_SIZE=%s\n",$2}')
+
+  /sbin/parted -m ${DISK_DEV} unit s print
+  /sbin/parted -m -s ${DISK_DEV} unit s rm 3
+  /sbin/parted -m ${DISK_DEV} unit s resizepart 2 $((${DISK_SIZE} - 1))
+
+  echo -n "${DEFAULT_KEY}" | /sbin/cryptsetup luksOpen ${LUKS_DEV} ${CRYPT_CONTAINER}
+
+  /sbin/lvm pvresize /dev/mapper/${CRYPT_CONTAINER}
+  /sbin/lvm lvextend -l +100%FREE /dev/mapper/${VG_NAME}-${LV_NAME}
+  /sbin/lvm vgchange -a y
+
+  /sbin/resize2fs -f /dev/mapper/${VG_NAME}-${LV_NAME}
+
+  /sbin/lvm vgchange -a n
+  /sbin/cryptsetup luksClose ${CRYPT_CONTAINER}
+
+  ###
+  sync
+  reboot
+
+#+END_SRC
+
+** resize root partition (also ramfs job)
+#+BEGIN_SRC bash
+  parted -m /dev/mmcblk0 unit s print
+  parted -m /dev/mmcblk0 unit s rm 3
+  parted -m /dev/mmcblk0 unit s resize 2 124735487
+
+  /sbin/cryptsetup luksOpen /dev/mmcblk0p2 rootfs
+
+  lvm
+  pvresize /dev/mapper/rootfs
+  lvextend -l +100%FREE /dev/vg0/lvroot
+  vgchange -a y
+
+  resize2fs -f /dev/mapper/vg0-lvroot
+
+  vgchange -a n
+#+END_SRC
+#+RESULTS:
+:RESULTS:
+BYT;
+/dev/mmcblk0:124735488s:sd/mmc:512:512:msdos:SD SN64G:;
+1:8192s:532479s:524288s:fat32::lba;
+2:532480s:18317311s:17784832s:::;
+3:18317312s:124735487s:106418176s:ext4::;
+:END:
+
+
+
+
+* Pi-Gen
+
+From the GitHub repository [[https://github.com/RPi-Distro/pi-gen][Pi-Gen]] it is possible to build a default image which elminates the need to do some of the initial image modification.
+#+BEGIN_SRC bash
+  #apt-get install coreutils quilt parted qemu-user-static debootstrap zerofree zip \
+  #        dosfstools bsdtar libcap2-bin grep rsync xz-utils file git curl bc
+
+  IMG_NAME=Modbian
+  TARGET_HOSTNAME=raspberrypi
+  FIRST_USER_NAME=pi
+  FIRST_USER_PASS=raspberry
+  WPA_ESSID=
+  WPA_PASSWORD=
+  WPA_COUNTRY=GB
+  ENABLE_SSH=1
+  PUBKEY_SSH_FIRST_USER=""
+  PUBKEY_ONLY_SSH=1
+
+#+END_SRC
+
+random notes
+#+BEGIN_SRC bash
+  /sbin/cryptsetup luksOpen /dev/mmcblk0p2 rootfs
+  /sbin/lvm
+  vgchange -a y
+  exit
+
+
+  #https://wiki.alpinelinux.org/wiki/LVM_on_LUKS
+  console=serial0,115200 console=tty1 root=/dev/mapper/vg00-lv01_root rootfstype=ext4 elevator=deadline fsck.repair=yes rootwait plymouth.ignore-serial-consoles debug cryptdevice=/dev/mmcblk0p2:rootfs cryptdm=rootfs
+
+  # remove debug?
+  console=serial0,115200 console=tty1 root=/dev/mapper/vg00-lv01_root rootfstype=ext4 elevator=deadline fsck.repair=yes rootwait plymouth.ignore-serial-consoles cryptdevice=/dev/mmcblk0p2:rootfs cryptdm=rootfs
+
+
+  #https://blog.badgerops.net/using-dropbear-ssh-daemon-to-enable-remote-luks-unlocking/
+
+
+  where is fsck.ext4 ? need to add it?
+#+END_SRC
+
+
+
+#+BEGIN_EXAMPLE
+  # /etc/fstab
+  proc            /proc           proc    defaults          0       0
+  PARTUUID=14cf79ee-01  /boot           vfat    defaults          0       2
+  /dev/mapper/rootfs  /               ext4    defaults,noatime  0       1
+  # a swapfile is not a swap partition, no line here
+  #   use  dphys-swapfile swap[on|off]  for that
+
+  # /etc/crypttab
+  # <target name> <source device> <key file> <options>
+  rootfs /dev/mmcblk0p2 none luks
+#+END_EXAMPLE
+
+* virtual Pi
+
+https://blog.agchapman.com/using-qemu-to-emulate-a-raspberry-pi/
+
+* pi from pi
+#+BEGIN_SRC bash
+  sudo chroot /media/ags/rootfs/
+  sudo mount --rbind /dev /media/ags/rootfs/dev/
+  sudo chroot /media/ags/rootfs/
+  sudo mount --rbind /sys /media/ags/rootfs/sys/
+  sudo mount -t proc /proc /media/ags/rootfs/proc/
+  sudo chroot /media/ags/rootfs/
+
+  sudo umount -l /media/ags/rootfs/dev
+  sudo umount -l /media/ags/rootfs/sys
+  sudo umount -l /media/ags/rootfs/proc
+
+
+  sudo parted /dev/sdc3 print
+  sudo parted /dev/sdc3 print
+  sudo parted /dev/sdc print
+
+#+END_SRC

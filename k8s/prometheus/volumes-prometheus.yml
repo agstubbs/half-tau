@@ -1,0 +1,40 @@
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: prometheus-server-pv
+spec:
+  capacity:
+    storage: 200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  #storageClassName: nfs
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+  nfs:
+    # owner nobody:nogroup
+    path: /srv/exports/monitoring/prometheus-server
+    server: 10.102.0.8
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: prometheus-alertmanager-pv
+spec:
+  capacity:
+    storage: 200Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  #storageClassName: nfs
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+  nfs:
+    # owner nobody:nogroup
+    path: /srv/exports/monitoring/prometheus-alertmanager
+    server: 10.102.0.8

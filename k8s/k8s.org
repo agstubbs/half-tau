@@ -1,0 +1,181 @@
+* references
+
+- [[https://opensource.com/article/20/6/kubernetes-raspberry-pi][Kubernetes on Raspberry Pi]]
+- [[https://amithm.ca/2020/10/kubernetes-raspberrypi-homelab/][also this]]
+- [[https://www.dinofizzotti.com/blog/2020-04-10-raspberry-pi-cluster-part-1-provisioning-with-ansible-and-temperature-monitoring-using-prometheus-and-grafana/][Fairly comprehensive]]
+
+* equipment
+
+** Overview and caveats
+
+Here we provide a basic list of equipment for a cluster.
+
+The cluster consists of a head node + 5 member nodes. This is seriously over-egging the pie for a basic system, which only really needs a head node and a single member node. Especially since 8GB devices now exist (they didn't when I was originally setting this up)
+
+I currently use only a single PoE switch to power all these units. This would be insufficient to power them all at peak utilisation, but it's enough for me for now. Each node draws under 4W with my minimal configuration. The PoE switch described has a rating of max 46W across all ports. Each individual port can use up to 15.4W. Probably 2 - 3 switches of a similar spec would be required, or a bigger more powerful (probably with a fan) switch would be sufficient.
+
+For shared persistent storage, I've included an NFS server. It isn't actually required to set up the basics, but is used for persistent storage for prometheus (see [[./prometheus/README.org][those documents]] for the configuration involved). It's not clear to me (i.e., I haven't actually investigated) whether the PoE power provided is sufficient to power an external USB3 SSD like the Samsung T7 1TB, which is the principal reason behind me using the "official" raspberry pi mains power supply for the NFS server rather than a PoE HAT. Also, I used a RPi 3 for the NFS server because it was what I had to hand, and I don't need any significant network throughput at this point. Another RPi 4 would probably do a better job for streaming or whatnot.
+
+Again with the power: the switch has no fan, but the PoE HAT fans actually whack up quite a racket, so in fact I only have 3 nodes online at time of writing. It might be quieter to use mains power adapters instead of PoE HATs, which might even be preferable for a rig run entirely on wifi instead of ethernet. But, my fans are currently in the default configuration. It's possible to [[https://jjj.blog/2020/02/raspberry-pi-poe-hat-fan-control/][alter the temperature profile of the fans]], and I suspect that would probably eliminate the noise problem entirely. This is next on my list.
+
+** Ingredients
+- Control Plane :: [[https://www.raspberrypi.org/products/raspberry-pi-4-model-b/][Raspberry Pi 4 Model B]], 4GB RAM, 128GB SD card (mostly unused)
+- Member nodes :: 5 x [[Raspberry Pi 4 Model B][Raspberry Pi 4 Model B]], mix of 4GB and 8GB RAM models, 128GB SD card
+- Power :: 6 x [[https://www.raspberrypi.org/products/poe-hat/][Raspberry Pi PoE HAT]]
+- Casing and containment :: [[https://www.myelectronics.nl/us/19-inch-rack-mount-3u-for-1-12-raspberry-pi.html][MyElectronics 19 inch rack mount 3U for 1-12 Raspberry Pi]]
+- Rack :: yeah, a small rack unit of some description. Something like a [[https://www.startech.com/en-gb/server-management/rk319wallv][StarTech 3U rack]] would probably be sufficient. I have another model, but I've had it so long I don't know where it came from originally.
+- NFS Server :: [[https://www.raspberrypi.org/products/raspberry-pi-3-model-b-plus/][Raspberry Pi 3 Model B+]], 1GB RAM, 64GB SD card (using USB power from a brick, not PoE)
+- NFS Shared storage :: Samsung T7 SSD 1TB
+- Firewall/Router :: [[https://www.firebrick.co.uk/fb2900/][Firebrick FB2900 Fully Loaded]] (BGP, DHCP, gateway, firewall, NAT etc.)
+- Network Switches :: [[https://www.amazon.co.uk/gp/product/B00MHLUS8E/ref=ppx_yo_dt_b_asin_title_o00_s00?ie=UTF8&psc=1][Netgear GS110TP 8 Port PoE Gigabit Ethernet Switch]]
+
+** Seasoning
+- Cables: network, usb
+- keyboard, monitor, mouse
+- bootstrap system (obvs) for writing OS images and whatnot
+
+* network plan overview
+
+Dedicated subnet for setup, all ethernet (no wifi), no requirement for nodes to use head node as NAT gateway. BGP networking for Metal LB enabled load balancers.
+
+** CIDR Reservations
+- 10.102.0.0/24 :: Control Plane, Nodes, NFS Server, etc.
+- 10.103.0.0/16 :: Metal LB
+
+** BGP
+- Firebrick :: AS 64512
+- Metal LB :: AS 64513
+
+** DNS
+- subdomain k8s.ffap.uk
+
+** Persistet Storage
+NFS server disk0.f8s.ffap.uk provides NFS disk storage
+
+This server has an additional external drive which needs to be unlocked in the initramfs dropbear environment.
+#+BEGIN_SRC bash
+/sbin/cryptsetup luksOpen /dev/sda1 datafs
+/sbin/lvm vgchange -a y
+cryptroot-unlock
+#+END_SRC
+
+* Install OS
+
+SD cards for all Raspberry Pi units encrypted with LUKS, with a pre-execution environment in a initial ramdisk image allowing for remote unencryption over ssh, as documented here:
+
+[[../luks/README.org][Remote-unlockable LUKS encrypted Raspberry Pi]]
+
+Obviously this step isn't strictly necessary, but it does provide some peace of mind.
+
+* install docker
+
+#+BEGIN_SRC bash
+  sudo apt-get install -y docker.io
+
+  cat <<EOF | sudo tee /etc/docker/daemon.json
+  {
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "log-driver": "json-file",
+    "log-opts": {
+      "max-size": "100m"
+    },
+    "storage-driver": "overlay2"
+  }
+  EOF
+
+  sudo sed -i -e '$ s/$/ cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 swapaccount=1/' /boot/cmdline.txt
+
+  # now reboot
+
+
+  cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+  net.bridge.bridge-nf-call-ip6tables = 1
+  net.bridge.bridge-nf-call-iptables = 1
+  EOF
+
+
+  sudo sysctl --system
+#+END_SRC
+* install k8s
+
+#+BEGIN_SRC bash
+  sudo swapoff -a
+  sudo systemctl disable dphys-swapfile.service
+
+
+  curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+
+  cat <<EOF | sudo tee /etc/apt/sources.list.d/kubernetes.list
+  deb https://apt.kubernetes.io/ kubernetes-xenial main
+  EOF
+
+  sudo apt update && sudo apt install -y kubelet kubeadm kubectl
+  sudo apt-mark hold kubelet kubeadm kubectl
+
+  #####
+
+
+  TOKEN=$(sudo kubeadm token generate)
+  # ou2poo.s5utt9vewsfdkh1t
+  sudo kubeadm init --token=${TOKEN} --pod-network-cidr=10.244.0.0/16
+
+  kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+
+
+
+
+  kubeadm join 10.102.0.9:6443 --token ou2poo.s5utt9vewsfdkh1t \
+          --discovery-token-ca-cert-hash sha256:52be74cb3660f0d8787284031877e76bd70d405a2750aa2ef9883b618e760e57
+
+#+END_SRC
+
+* Networking
+
+Install [[https://metallb.universe.tf/][Metal LB]]
+
+** Metal LB Configmap
+
+#+BEGIN_SRC yaml
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    namespace: metallb-system
+    name: config
+  data:
+    config: |
+      peers:
+      - peer-address: 10.102.0.1
+        peer-asn: 64512
+        my-asn: 64513
+      address-pools:
+      - name: default
+        protocol: bgp
+        addresses:
+        - 10.103.0.0/16
+#+END_SRC
+
+** Firebrick BGP configuration
+#+BEGIN_SRC xml
+  <bgp as="64512">
+     <peer type="normal" ip="10.102.0.9" as="64513" drop-default="true"/>
+     <peer type="normal" ip="10.102.0.10" as="64513" drop-default="true"/>
+     <peer type="normal" ip="10.102.0.11" as="64513" drop-default="true"/>
+     <peer type="normal" ip="10.102.0.12" as="64513" drop-default="true"/>
+     <peer type="normal" ip="10.102.0.13" as="64513" drop-default="true"/>
+     <peer type="normal" ip="10.102.0.14" as="64513" drop-default="true"/>
+  </bgp>
+#+END_SRC
+
+* PoE Fan Speed
+
+- https://jjj.blog/2020/02/raspberry-pi-poe-hat-fan-control/
+- https://github.com/raspberrypi/linux/issues/2715
+- https://jjj.blog/2020/06/raspberry-pi-4-ubuntu-20-04-poe-hat-fan-control/
+- https://raspberrypi.stackexchange.com/questions/98078/poe-hat-fan-activation-on-os-other-than-raspbian
+
+#+BEGIN_EXAMPLE
+dtparam=poe_fan_temp0=80000,poe_fan_temp0_hyst=2000
+dtparam=poe_fan_temp1=78000,poe_fan_temp1_hyst=5000
+dtparam=poe_fan_temp2=73000,poe_fan_temp2_hyst=3000
+dtparam=poe_fan_temp3=70000,poe_fan_temp3_hyst=5000
+#+END_EXAMPLE
